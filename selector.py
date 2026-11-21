@@ -46,13 +46,52 @@ _DIALECT_DIRS = ("dialects", "parsers", "generators", "typing")
 # none of which share "presto" as a dialect name, so the sibling-by-name
 # escalation above never reaches them. Map each dialect to its direct
 # children so we can walk the whole subtree.
+#
+# Athena is the one dialect in the whole codebase with TWO parents, not
+# one, and it's not even plain class inheritance for most of it -- verified
+# by reading dialects/athena.py, parsers/athena.py and generators/athena.py
+# directly:
+#   - dialects/athena.py's Tokenizer builds its IDENTIFIERS/STRING_ESCAPES/
+#     HEX_STRINGS/UNICODE_STRINGS/NUMERIC_LITERALS/KEYWORDS by concatenating
+#     Trino.Tokenizer's and Hive.Tokenizer's class attributes, and also
+#     instantiates a live Hive().tokenizer() it dispatches to at runtime.
+#   - parsers/athena.py imports Hive and instantiates a real hive.parser()
+#     (self._hive_parser) it delegates to for Hive-flavored statements.
+#   - generators/athena.py instantiates both a Hive-subclassing
+#     _HiveGenerator and a Trino-subclassing AthenaTrinoGenerator and
+#     dispatches generate() to whichever matches the expression.
+# So besides the already-mapped presto->trino->athena inheritance chain,
+# Athena has a second, independent dependency straight on Hive that a
+# change to sqlglot/{dialects,parsers,generators}/hive.py must also reach.
+#
+# Presto has exactly the same shape of problem, verified the same way --
+# confirmed with an exhaustive grep across every dialects/parsers/
+# generators/typing/*.py file for "ATTR = OtherDialect.ATTR" classbody
+# assignments and "**OtherDialect.ATTR" dict-merges, then checked each hit
+# against the existing inheritance map (almost all of them, e.g. every
+# Spark2/Hive, Trino/Presto, Databricks/Spark, Doris-SingleStore-StarRocks/
+# MySQL and Redshift-RisingWave-Materialize/Postgres merge, are just a
+# dialect extending its OWN already-mapped parent's dict -- unsurprising
+# and already handled):
+#   - sqlglot/dialects/presto.py's Presto class body has
+#     "TIME_FORMAT = MySQL.TIME_FORMAT" and "TIME_MAPPING = MySQL.
+#     TIME_MAPPING" -- copied once, at class-creation time, from a dialect
+#     Presto does NOT inherit from at all.
+#   - sqlglot/generators/presto.py calls self.format_time(expression,
+#     Hive.INVERSE_TIME_MAPPING, Hive.INVERSE_TIME_TRIE) -- Hive's own
+#     derived time-mapping table (computed from Hive's TIME_MAPPING by the
+#     _Dialect metaclass), read straight off the Hive class, to generate
+#     Presto/Trino/Athena/Dune datetime SQL.
+# So a classbody-level change to mysql.py OR hive.py must also escalate to
+# presto (and transitively, via the existing presto->trino->{athena,dune}
+# edge, to all of Presto's own descendants too).
 _DIALECT_CHILDREN: dict[str, tuple[str, ...]] = {
     "presto": ("trino",),
     "trino": ("athena", "dune"),
-    "hive": ("spark2",),
+    "hive": ("spark2", "athena", "presto"),
     "spark2": ("spark",),
     "spark": ("databricks",),
-    "mysql": ("doris", "singlestore", "starrocks"),
+    "mysql": ("doris", "singlestore", "starrocks", "presto"),
     "postgres": ("materialize", "redshift", "risingwave"),
     "tsql": ("fabric",),
 }
