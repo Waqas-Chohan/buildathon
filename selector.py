@@ -65,6 +65,17 @@ _FOUNDATIONAL_FILES = frozenset({
     "sqlglot/executor/env.py",
     "sqlglot/planner.py",
     "sqlglot/schema.py",
+    # dialects/dialect.py's base Dialect class defaults every dialect's
+    # parser_class/generator_class/tokenizer_class to Generator (generator.py,
+    # already listed), Tokenizer (tokens.py, already listed), and BaseParser --
+    # defined here, NOT in dialects/, so _dialect_sibling_tests (which only
+    # pairs up same-named files across dialects/parsers/generators/typing)
+    # never finds it: there's no dialects/base.py to pair it with. Any dialect
+    # that doesn't override parser_class inherits straight from this.
+    "sqlglot/parsers/base.py",
+    # Same shape of gap for jsonpath_tokenizer_class = JSONPathTokenizer,
+    # defined in jsonpath.py subclassing the base Tokenizer.
+    "sqlglot/jsonpath.py",
 })
 
 
