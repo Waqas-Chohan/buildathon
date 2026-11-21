@@ -9,6 +9,7 @@ import io
 import json
 import os
 import pickle
+import unittest
 
 import pytest
 
@@ -65,9 +66,12 @@ concurrent.futures.ProcessPoolExecutor = _SyncExecutor
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 _CURRENT_TEST = [None]
-_FIXTURE_TOUCHES = {}  # relpath -> set of test ids
+_FIXTURE_TOUCHES = {}  # relpath -> set of (test id OR "CLASSWIDE::<key>") markers
+_CLASS_TO_TESTS: dict[str, set] = {}  # "module.qualname" -> set of nodeids in that class
 
 _real_open = builtins.open
+
+_CLASSWIDE_PREFIX = "CLASSWIDE::"
 
 
 def _tracking_open(file, mode="r", *args, **kwargs):
@@ -96,8 +100,80 @@ def _track_current_test(request):
         _CURRENT_TEST[0] = None
 
 
+# -- setUpClass fixture-file blind spot ------------------------------------
+# unittest.TestCase.setUpClass runs ONCE per test class, BEFORE our own
+# function-scoped `_track_current_test` autouse fixture has set
+# _CURRENT_TEST[0] for the class's first test. Several real test classes
+# (TestExecutor above all) load non-Python fixture files there -- TPC-H/
+# TPC-DS .csv.gz tables and their .sql fixture -- shared by every test
+# method in the class. Without this, those opens happen while
+# _CURRENT_TEST[0] is still None, so _tracking_open silently drops them:
+# the fixture files never make it into the index at all, and a hidden
+# commit that edits one of them would get ZERO tests selected -- a
+# guaranteed miss for every test that actually depends on it. (Confirmed:
+# tests/fixtures/optimizer/tpc-ds/*.csv.gz don't appear in the index at
+# all, and tpc-ds.sql/tpc-h.sql are each attributed to only the one
+# test_optimizer.py test that happens to read them directly inside its own
+# test body, missing test_executor.py's test_execute_tpcds/test_execute_tpch
+# entirely.)
+#
+# Fix: wrap every collected TestCase subclass's own setUpClass (only if it
+# defines one) so that, for its duration, _CURRENT_TEST[0] is a classwide
+# marker instead of None. At session end, expand that marker into every
+# test nodeid that belongs to the class -- safe (attributes to the real
+# consumers, never fewer) even though it's broader than per-test precision
+# would be, since a whole TestExecutor-sized class is still tiny next to
+# the 300s-per-miss cost of getting it wrong.
+def _wrap_setupclass(cls: type) -> None:
+    orig = cls.__dict__.get("setUpClass")
+    if orig is None or getattr(orig, "_blast_radius_wrapped", False):
+        return
+    key = f"{cls.__module__}.{cls.__qualname__}"
+
+    def wrapper(cls_, *a, **kw):
+        prev = _CURRENT_TEST[0]
+        _CURRENT_TEST[0] = _CLASSWIDE_PREFIX + key
+        try:
+            return orig.__func__(cls_, *a, **kw)
+        finally:
+            _CURRENT_TEST[0] = prev
+
+    wrapper._blast_radius_wrapped = True
+    cls.setUpClass = classmethod(wrapper)
+
+
+# pytest's unittest integration reads cls.setUpClass off the class and
+# wraps it into its own fixture *inside* UnitTestCase.collect(). By the
+# time pytest_collection_modifyitems fires (after collection is fully
+# done), that reference has already been captured, so patching there is
+# too late -- confirmed empirically (0 extra tests attributed). collect()
+# is called from collect_one_node() right after the pytest_collectstart
+# hook fires for that same collector, so patching here runs first.
+def pytest_collectstart(collector):
+    cls = getattr(collector, "obj", None)
+    if isinstance(cls, type) and issubclass(cls, unittest.TestCase):
+        _wrap_setupclass(cls)
+
+
+def pytest_collection_modifyitems(session, config, items):
+    for item in items:
+        cls = getattr(item, "cls", None)
+        if cls is None:
+            continue
+        key = f"{cls.__module__}.{cls.__qualname__}"
+        _CLASS_TO_TESTS.setdefault(key, set()).add(item.nodeid)
+
+
 def pytest_sessionfinish(session, exitstatus):
-    out = {path: sorted(tests) for path, tests in _FIXTURE_TOUCHES.items()}
+    out = {}
+    for path, markers in _FIXTURE_TOUCHES.items():
+        expanded = set()
+        for m in markers:
+            if m.startswith(_CLASSWIDE_PREFIX):
+                expanded.update(_CLASS_TO_TESTS.get(m[len(_CLASSWIDE_PREFIX):], set()))
+            else:
+                expanded.add(m)
+        out[path] = sorted(expanded)
     out_path = os.environ.get("FIXTURE_TOUCHES_OUT", "/tmp/fixture_touches.json")
     with _real_open(out_path, "w", encoding="utf-8") as f:
         json.dump(out, f)
