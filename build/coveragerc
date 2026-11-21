@@ -1,0 +1,10 @@
+[run]
+source = .
+branch = false
+omit =
+    */site-packages/*
+    */.venv/*
+    */venv/*
+    conftest.py
+
+[report]
