@@ -147,6 +147,17 @@ _FOUNDATIONAL_FILES = frozenset({
     # Same shape of gap for jsonpath_tokenizer_class = JSONPathTokenizer,
     # defined in jsonpath.py subclassing the base Tokenizer.
     "sqlglot/jsonpath.py",
+    # Same shape of gap one more time, confirmed by grepping every
+    # dialects/*.py file for "TypeAnnotator." (the class defined here):
+    # sqlglot/dialects/bigquery.py builds its own COERCES_TO dict as
+    # "**TypeAnnotator.COERCES_TO, <bigquery overrides>" at class-body
+    # time, with zero inheritance relationship to this file at all --
+    # bigquery.py doesn't subclass TypeAnnotator, it just copies its dict
+    # once. Any dialect's type-annotation tests could be relying on this
+    # same base COERCES_TO table even without copying it verbatim, so
+    # treat this file the same as the other optimizer/executor base
+    # classes above rather than chase down every individual reader.
+    "sqlglot/optimizer/annotate_types.py",
 })
 
 
