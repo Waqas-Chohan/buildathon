@@ -36,6 +36,38 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIALECT_FILE_RE = re.compile(r"^sqlglot/(dialects|parsers|generators|typing)/([^/]+)\.py$")
 _DIALECT_DIRS = ("dialects", "parsers", "generators", "typing")
 
+# Several dialects subclass ANOTHER dialect, not just the base Dialect class
+# -- and not just the outer class either: their nested Tokenizer/Generator/
+# Parser classes explicitly inherit from the parent dialect's nested classes
+# too (e.g. "class Trino(Presto): class Tokenizer(Presto.Tokenizer): ..."),
+# confirmed by reading every dialects/*.py file directly. A classbody-level
+# change in sqlglot/dialects/presto.py (or its parsers/generators/typing
+# siblings) can silently affect Trino, and transitively Athena and Dune,
+# none of which share "presto" as a dialect name, so the sibling-by-name
+# escalation above never reaches them. Map each dialect to its direct
+# children so we can walk the whole subtree.
+_DIALECT_CHILDREN: dict[str, tuple[str, ...]] = {
+    "presto": ("trino",),
+    "trino": ("athena", "dune"),
+    "hive": ("spark2",),
+    "spark2": ("spark",),
+    "spark": ("databricks",),
+    "mysql": ("doris", "singlestore", "starrocks"),
+    "postgres": ("materialize", "redshift", "risingwave"),
+    "tsql": ("fabric",),
+}
+
+
+def _dialect_descendants(name: str) -> list[str]:
+    out: list[str] = []
+    stack = list(_DIALECT_CHILDREN.get(name, ()))
+    while stack:
+        child = stack.pop()
+        if child not in out:
+            out.append(child)
+            stack.extend(_DIALECT_CHILDREN.get(child, ()))
+    return out
+
 # A handful of files define the base classes almost everything else in the
 # codebase inherits from or is built on (Generator, Parser, Tokenizer,
 # Dialect, Expression, and -- one level down -- Scope/Resolver in the
@@ -225,16 +257,17 @@ class FileResolver:
 
 def _dialect_sibling_tests(dialect_name: str, files_index: dict, resolver_cache: dict,
                             selected: set[int]) -> None:
-    for d in _DIALECT_DIRS:
-        sib_path = f"sqlglot/{d}/{dialect_name}.py"
-        sib_index = files_index.get(sib_path)
-        if sib_index is None or sib_index["kind"] != "python":
-            continue
-        resolver = resolver_cache.get(sib_path)
-        if resolver is None:
-            resolver = FileResolver(sib_index)
-            resolver_cache[sib_path] = resolver
-        selected.update(resolver.aggregate(1, sib_index["file_hi"]))
+    for name in (dialect_name, *_dialect_descendants(dialect_name)):
+        for d in _DIALECT_DIRS:
+            sib_path = f"sqlglot/{d}/{name}.py"
+            sib_index = files_index.get(sib_path)
+            if sib_index is None or sib_index["kind"] != "python":
+                continue
+            resolver = resolver_cache.get(sib_path)
+            if resolver is None:
+                resolver = FileResolver(sib_index)
+                resolver_cache[sib_path] = resolver
+            selected.update(resolver.aggregate(1, sib_index["file_hi"]))
 
 
 def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[set[int], bool]:
