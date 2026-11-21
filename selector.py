@@ -141,7 +141,14 @@ def parse_diff(patch_text: str):
                 elif hl.startswith("+"):
                     if not is_trivial(hl[1:]):
                         insert_anchors.add(max(old_cursor - 1, 1))
-                elif hl.startswith(" "):
+                elif hl.startswith(" ") or hl == "":
+                    # A context line for a blank source line can come through
+                    # with its leading marker space stripped (trailing-
+                    # whitespace trimming in some diff generators), appearing
+                    # as a totally empty line rather than a single space. If
+                    # we don't count it, every line-number computation for
+                    # the rest of this hunk silently shifts by one -- treat
+                    # it as a context line, not as something to ignore.
                     old_cursor += 1
                 # lines starting with "\" (no newline at EOF) or anything else: ignore
                 i += 1
