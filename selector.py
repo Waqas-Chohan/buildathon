@@ -38,17 +38,19 @@ _DIALECT_DIRS = ("dialects", "parsers", "generators", "typing")
 
 # A handful of files define the base classes almost everything else in the
 # codebase inherits from or is built on (Generator, Parser, Tokenizer,
-# Dialect, Expression). A class/module-level attribute on one of these is
-# the same "executes once at import, coverage sees only the first importer"
-# problem as the sibling-dialect case, except the blast radius isn't a
-# handful of sibling files -- it can be almost the entire test suite,
-# since every dialect's generator/parser/tokenizer subclasses one of these.
-# Found exactly this failure mode once already in production (a real
-# submission run missed 2 commits we have no visibility into) -- rather
-# than guess which specific attribute it was, treat any non-body-level
-# change to one of these foundational files as "select everything". A few
-# extra seconds of test time per such commit is far cheaper than a 300s
-# miss, and these files change rarely in practice.
+# Dialect, Expression, and -- one level down -- Scope/Resolver in the
+# optimizer and Table/Context/Plan/Schema in the executor). A class/
+# module-level attribute on one of these is the same "executes once at
+# import, coverage sees only the first importer" problem as the
+# sibling-dialect case, except the blast radius isn't a handful of
+# sibling files -- it can be most of the optimizer or executor test
+# suite, since every rule module / dialect subclasses or operates on one
+# of these. Found exactly this failure mode once already in production
+# (a real submission run missed 2 commits we have no visibility into) --
+# rather than guess which specific attribute it was, treat any
+# non-body-level change to one of these foundational files as "select
+# everything". A few extra seconds of test time per such commit is far
+# cheaper than a 300s miss, and these files change rarely in practice.
 _FOUNDATIONAL_FILES = frozenset({
     "sqlglot/generator.py",
     "sqlglot/parser.py",
@@ -56,6 +58,13 @@ _FOUNDATIONAL_FILES = frozenset({
     "sqlglot/tokenizer_core.py",
     "sqlglot/dialects/dialect.py",
     "sqlglot/expressions/core.py",
+    "sqlglot/optimizer/scope.py",
+    "sqlglot/optimizer/resolver.py",
+    "sqlglot/executor/table.py",
+    "sqlglot/executor/context.py",
+    "sqlglot/executor/env.py",
+    "sqlglot/planner.py",
+    "sqlglot/schema.py",
 })
 
 
