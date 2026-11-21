@@ -36,6 +36,28 @@ HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _DIALECT_FILE_RE = re.compile(r"^sqlglot/(dialects|parsers|generators|typing)/([^/]+)\.py$")
 _DIALECT_DIRS = ("dialects", "parsers", "generators", "typing")
 
+# A handful of files define the base classes almost everything else in the
+# codebase inherits from or is built on (Generator, Parser, Tokenizer,
+# Dialect, Expression). A class/module-level attribute on one of these is
+# the same "executes once at import, coverage sees only the first importer"
+# problem as the sibling-dialect case, except the blast radius isn't a
+# handful of sibling files -- it can be almost the entire test suite,
+# since every dialect's generator/parser/tokenizer subclasses one of these.
+# Found exactly this failure mode once already in production (a real
+# submission run missed 2 commits we have no visibility into) -- rather
+# than guess which specific attribute it was, treat any non-body-level
+# change to one of these foundational files as "select everything". A few
+# extra seconds of test time per such commit is far cheaper than a 300s
+# miss, and these files change rarely in practice.
+_FOUNDATIONAL_FILES = frozenset({
+    "sqlglot/generator.py",
+    "sqlglot/parser.py",
+    "sqlglot/tokens.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/expressions/core.py",
+})
+
 
 def is_trivial(line_content: str) -> bool:
     s = line_content.strip()
@@ -188,8 +210,13 @@ def _dialect_sibling_tests(dialect_name: str, files_index: dict, resolver_cache:
         selected.update(resolver.aggregate(1, sib_index["file_hi"]))
 
 
-def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> set[int]:
+def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[set[int], bool]:
+    """Returns (selected_test_ints, select_all). select_all is True when a
+    non-precise change touched a foundational base-class file, in which case
+    the caller should run the full suite for this commit rather than trust
+    the (necessarily incomplete) selected set."""
     selected: set[int] = set()
+    select_all = False
     for old_path, new_path, changed_old, insert_anchors in sections:
         path = old_path if old_path is not None else new_path
         if path is None:
@@ -212,8 +239,12 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> set[int
             precise = resolver.select_for_changed_line(line, selected)
             if not precise:
                 needs_dialect_escalation = True
+                if path in _FOUNDATIONAL_FILES:
+                    select_all = True
         if insert_anchors:
             needs_dialect_escalation = True
+            if path in _FOUNDATIONAL_FILES:
+                select_all = True
         for anchor in insert_anchors:
             resolver.select_for_insertion(anchor, selected)
 
@@ -221,7 +252,7 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> set[int
             m = _DIALECT_FILE_RE.match(path)
             if m:
                 _dialect_sibling_tests(m.group(2), files_index, resolver_cache, selected)
-    return selected
+    return selected, select_all
 
 
 def pack_workers(tests_with_durations: list[tuple[int, int]]) -> list[list[int]]:
@@ -265,13 +296,16 @@ def main() -> None:
         try:
             text = patch_path.read_text(encoding="utf-8", errors="replace")
             sections = parse_diff(text)
-            selected_ints = resolve_commit(sections, files_index, resolver_cache)
-            selected_numbers: set[int] = set()
-            for i in selected_ints:
-                tid = test_ids[i]
-                num = id_to_number.get(tid)
-                if num is not None:
-                    selected_numbers.add(num)
+            selected_ints, select_all = resolve_commit(sections, files_index, resolver_cache)
+            if select_all:
+                selected_numbers = set(all_numbers)
+            else:
+                selected_numbers = set()
+                for i in selected_ints:
+                    tid = test_ids[i]
+                    num = id_to_number.get(tid)
+                    if num is not None:
+                        selected_numbers.add(num)
         except Exception as exc:  # noqa: BLE001 - never let one bad patch sink the batch
             print(f"selector: fallback for {commit}: {exc!r}", file=sys.stderr)
             selected_numbers = set(all_numbers)
