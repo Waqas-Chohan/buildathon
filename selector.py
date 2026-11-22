@@ -192,6 +192,49 @@ def _strip_prefix(p: str) -> str:
 _DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
 
 
+def _code_tokens(line: str):
+    """Token strings of one source line (None if it doesn't tokenize alone)."""
+    import io
+    import tokenize
+
+    try:
+        toks = tokenize.generate_tokens(io.StringIO(line.strip() + "\n").readline)
+        return [t.string for t in toks if t.type not in (
+            tokenize.NEWLINE, tokenize.NL, tokenize.ENDMARKER, tokenize.INDENT,
+            tokenize.DEDENT, tokenize.COMMENT)]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return None
+
+
+def _none_identity_to_equality(tokens):
+    out, i = [], 0
+    while i < len(tokens):
+        if tokens[i] == "is" and i + 2 < len(tokens) and tokens[i + 1] == "not" and tokens[i + 2] == "None":
+            out += ["!=", "None"]
+            i += 3
+        elif tokens[i] == "is" and i + 1 < len(tokens) and tokens[i + 1] == "None":
+            out += ["==", "None"]
+            i += 2
+        else:
+            out.append(tokens[i])
+            i += 1
+    return out
+
+
+def is_none_comparison_rewrite(old: str, new: str) -> bool:
+    """`x is None` <-> `x == None` (and `is not` <-> `!=`) and nothing else.
+
+    Equivalent for every object sqlglot compares with None: builtins,
+    Expression.__eq__ (False unless type(other) is type(self)), Dialect and
+    _Dialect.__eq__ (type comparisons). Token-level, so text inside string
+    literals never matches. Not used for `is True/False` (1 == True) or
+    `is <object>` (== is structural equality on expressions)."""
+    a, b = _code_tokens(old), _code_tokens(new)
+    if a is None or b is None or a == b:
+        return False
+    return _none_identity_to_equality(a) == _none_identity_to_equality(b)
+
+
 def parse_diff(patch_text: str):
     """Returns one tuple per file section:
         (old_path, new_path, changed_old, insert_anchors,
@@ -207,15 +250,17 @@ def parse_diff(patch_text: str):
 
     def flush():
         if sec is not None:
+            equiv = sec["pairs_ok"] and sec["npairs"] > 0 and not sec["bin"]
             results.append((sec["old"], sec["new"], sec["chg"], sec["ins"],
-                            sec["tchg"], sec["tins"], sec["bin"]))
+                            sec["tchg"], sec["tins"], sec["bin"], equiv))
 
     while i < n:
         line = lines[i]
         if line.startswith("diff --git "):
             flush()
             sec = {"old": None, "new": None, "chg": set(), "ins": set(),
-                   "tchg": set(), "tins": set(), "bin": False}
+                   "tchg": set(), "tins": set(), "bin": False,
+                   "pairs_ok": True, "npairs": 0}
             # Paths from the header too, so a section with no ---/+++ lines
             # (binary patch, pure mode change) still names its file.
             m = _DIFF_GIT_RE.match(line)
@@ -253,6 +298,22 @@ def parse_diff(patch_text: str):
             # a prefix check would mistake for file headers.
             old_left = int(m.group(2)) if m.group(2) is not None else 1
             new_left = int(m.group(4)) if m.group(4) is not None else 1
+            minus: list[str] = []
+            plus: list[str] = []
+
+            def close_block():
+                # Pair a run of non-trivial "-" lines with the "+" lines that
+                # replace it, to recognise provably equivalent rewrites.
+                if minus or plus:
+                    if len(minus) == len(plus) and all(
+                        is_none_comparison_rewrite(a, b) for a, b in zip(minus, plus)
+                    ):
+                        sec["npairs"] += len(minus)
+                    else:
+                        sec["pairs_ok"] = False
+                minus.clear()
+                plus.clear()
+
             i += 1
             while i < n and (old_left > 0 or new_left > 0):
                 hl = lines[i]
@@ -262,13 +323,24 @@ def parse_diff(patch_text: str):
                 if hl.startswith("diff --git ") or HUNK_RE.match(hl):
                     break  # truncated hunk: stop rather than misread
                 if hl.startswith("-"):
-                    (sec["tchg"] if is_trivial(hl[1:]) else sec["chg"]).add(old_cursor)
+                    if is_trivial(hl[1:]):
+                        sec["tchg"].add(old_cursor)
+                    else:
+                        sec["chg"].add(old_cursor)
+                        if plus:
+                            close_block()
+                        minus.append(hl[1:])
                     old_cursor += 1
                     old_left -= 1
                 elif hl.startswith("+"):
-                    (sec["tins"] if is_trivial(hl[1:]) else sec["ins"]).add(max(old_cursor - 1, 1))
+                    if is_trivial(hl[1:]):
+                        sec["tins"].add(max(old_cursor - 1, 1))
+                    else:
+                        sec["ins"].add(max(old_cursor - 1, 1))
+                        plus.append(hl[1:])
                     new_left -= 1
                 else:
+                    close_block()
                     # Context line. One for a blank source line can come
                     # through with its leading space stripped (trailing-
                     # whitespace trimming), i.e. as a totally empty line --
@@ -278,6 +350,7 @@ def parse_diff(patch_text: str):
                     old_left -= 1
                     new_left -= 1
                 i += 1
+            close_block()
             continue
         i += 1
     flush()
@@ -548,6 +621,9 @@ _PRECISE_FOUNDATIONAL = False
 # testing shows it never misses.
 _TIGHT = False
 
+# Skip files whose only edits are provably equivalent rewrites.
+_EQUIV = True
+
 
 def configure(index: dict) -> None:
     """Load index-wide settings (call once before resolve_commit)."""
@@ -563,7 +639,7 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
     selected: set[int] = set()
     select_all = False
     for (old_path, new_path, changed_old, insert_anchors,
-         trivial_old, trivial_anchors, binary) in sections:
+         trivial_old, trivial_anchors, binary, equivalent) in sections:
         path = old_path if old_path is not None else new_path
         if path is None:
             continue
@@ -588,6 +664,8 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         # A "# comment" or blank line is only harmless outside string
         # literals. Inside a multi-line string whose value is used at
         # runtime it changes that value, so treat it as a real edit.
+        file_changed_before_strings = changed_old
+        file_inserts_before_strings = insert_anchors
         if trivial_old or trivial_anchors:
             changed_old = set(changed_old)
             insert_anchors = set(insert_anchors)
@@ -598,10 +676,27 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
                 if resolver.string_insert_after(a):
                     insert_anchors.add(a)
 
+        # Every real edit in this file is an `is None` <-> `== None` style
+        # rewrite (provably equivalent; see is_none_comparison_rewrite) and
+        # no comment/blank edit landed inside a runtime string: nothing can
+        # fail. executor/env.py is excluded: its reverse-sort-key wrapper's
+        # __eq__ dereferences other.obj and would raise on None.
+        if (
+            _EQUIV
+            and equivalent
+            and path.endswith(".py")
+            and path != "sqlglot/executor/env.py"
+            and len(changed_old) == len(file_changed_before_strings)
+            and len(insert_anchors) == len(file_inserts_before_strings)
+            and not any(resolver.string_line_removed(ln) for ln in changed_old)
+        ):
+            continue
+
         if _TIGHT:
             changed_old, insert_anchors = resolver.take_runtime_edits(
                 changed_old, insert_anchors, selected
             )
+
 
         needs_dialect_escalation = False
         import_owners: set[str] = set()
