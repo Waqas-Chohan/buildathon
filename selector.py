@@ -472,7 +472,10 @@ _EAGER_FILES: frozenset = frozenset()
 # When True, a foundational file only escalates to the full suite for
 # class/module-level, header, import-time or ambiguous edits; an edit
 # inside an ordinary method body uses that method's exact test set like any
-# other file. Off unless mutation testing shows it never misses.
+# other file. DO NOT ENABLE: a foundational-only mutation campaign found a
+# miss within 9 mutants (parser.py:4653 `if not self._match(TokenType.INTO)`
+# -> `if self._match(...)` broke Athena/BigQuery tests outside the precise
+# selection). The full-suite fallback for core files is load-bearing.
 _PRECISE_FOUNDATIONAL = False
 
 
