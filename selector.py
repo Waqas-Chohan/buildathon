@@ -178,66 +178,94 @@ def _strip_prefix(p: str) -> str:
     return p
 
 
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$")
+
+
 def parse_diff(patch_text: str):
-    """Yields (old_path, new_path, changed_old_lines, insert_anchors) per file."""
+    """Returns one tuple per file section:
+        (old_path, new_path, changed_old, insert_anchors,
+         trivial_old, trivial_anchors, binary)
+    changed_old / insert_anchors hold non-comment, non-blank edits (in old-
+    file line numbers); trivial_old / trivial_anchors hold comment/blank
+    edits, which are only harmless for Python outside string literals --
+    resolve_commit decides. binary is True for a binary patch (no hunks)."""
     lines = patch_text.splitlines()
     i, n = 0, len(lines)
     results = []
-    old_path = new_path = None
-    changed_old: set[int] = set()
-    insert_anchors: set[int] = set()
-    have_section = False
+    sec: dict | None = None
 
     def flush():
-        if have_section:
-            results.append((old_path, new_path, changed_old, insert_anchors))
+        if sec is not None:
+            results.append((sec["old"], sec["new"], sec["chg"], sec["ins"],
+                            sec["tchg"], sec["tins"], sec["bin"]))
 
     while i < n:
         line = lines[i]
         if line.startswith("diff --git "):
             flush()
-            old_path = new_path = None
-            changed_old = set()
-            insert_anchors = set()
-            have_section = True
+            sec = {"old": None, "new": None, "chg": set(), "ins": set(),
+                   "tchg": set(), "tins": set(), "bin": False}
+            # Paths from the header too, so a section with no ---/+++ lines
+            # (binary patch, pure mode change) still names its file.
+            m = _DIFF_GIT_RE.match(line)
+            if m:
+                sec["old"], sec["new"] = m.group(1), m.group(2)
+            i += 1
+            continue
+        if sec is None:
             i += 1
             continue
         if line.startswith("--- "):
             p = line[4:]
-            old_path = None if p.strip() == "/dev/null" else _strip_prefix(p)
+            sec["old"] = None if p.strip() == "/dev/null" else _strip_prefix(p)
             i += 1
             continue
         if line.startswith("+++ "):
             p = line[4:]
-            new_path = None if p.strip() == "/dev/null" else _strip_prefix(p)
+            sec["new"] = None if p.strip() == "/dev/null" else _strip_prefix(p)
             i += 1
             continue
+        if line.startswith("new file mode"):
+            sec["old"] = None
+        elif line.startswith("deleted file mode"):
+            sec["new"] = None
+        elif line.startswith("GIT binary patch") or (
+            line.startswith("Binary files ") and line.rstrip().endswith(" differ")
+        ):
+            sec["bin"] = True
         m = HUNK_RE.match(line)
         if m:
             old_cursor = int(m.group(1))
+            # Use the hunk's own line counts to know where it ends, rather
+            # than guessing from line prefixes: a removed SQL comment
+            # "-- x" shows up as "--- x" and an added one as "+-- x", which
+            # a prefix check would mistake for file headers.
+            old_left = int(m.group(2)) if m.group(2) is not None else 1
+            new_left = int(m.group(4)) if m.group(4) is not None else 1
             i += 1
-            while i < n and not lines[i].startswith("@@") and not lines[i].startswith("diff --git "):
+            while i < n and (old_left > 0 or new_left > 0):
                 hl = lines[i]
-                if hl.startswith("---") or hl.startswith("+++"):
+                if hl.startswith("\\"):  # "\ No newline at end of file"
                     i += 1
                     continue
+                if hl.startswith("diff --git ") or HUNK_RE.match(hl):
+                    break  # truncated hunk: stop rather than misread
                 if hl.startswith("-"):
-                    if not is_trivial(hl[1:]):
-                        changed_old.add(old_cursor)
+                    (sec["tchg"] if is_trivial(hl[1:]) else sec["chg"]).add(old_cursor)
                     old_cursor += 1
+                    old_left -= 1
                 elif hl.startswith("+"):
-                    if not is_trivial(hl[1:]):
-                        insert_anchors.add(max(old_cursor - 1, 1))
-                elif hl.startswith(" ") or hl == "":
-                    # A context line for a blank source line can come through
-                    # with its leading marker space stripped (trailing-
-                    # whitespace trimming in some diff generators), appearing
-                    # as a totally empty line rather than a single space. If
-                    # we don't count it, every line-number computation for
-                    # the rest of this hunk silently shifts by one -- treat
-                    # it as a context line, not as something to ignore.
+                    (sec["tins"] if is_trivial(hl[1:]) else sec["ins"]).add(max(old_cursor - 1, 1))
+                    new_left -= 1
+                else:
+                    # Context line. One for a blank source line can come
+                    # through with its leading space stripped (trailing-
+                    # whitespace trimming), i.e. as a totally empty line --
+                    # still a context line, or every later line number in
+                    # the hunk shifts by one.
                     old_cursor += 1
-                # lines starting with "\" (no newline at EOF) or anything else: ignore
+                    old_left -= 1
+                    new_left -= 1
                 i += 1
             continue
         i += 1
@@ -368,6 +396,15 @@ class FileResolver:
             return None
         return exprcls.get(best[2])
 
+    def string_line_removed(self, line: int) -> bool:
+        """Removing old line `line` changes a runtime multi-line string
+        literal spanning [lo, hi] (opening quote on lo, closing on hi)."""
+        return any(lo < line < hi for lo, hi in self.idx.get("strspans", ()))
+
+    def string_insert_after(self, anchor: int) -> bool:
+        """Inserting a line after old line `anchor` lands inside one."""
+        return any(lo <= anchor < hi for lo, hi in self.idx.get("strspans", ()))
+
     def signature_span(self, line: int):
         """(func_lo, func_hi) if `line` is a parameter line of a multi-line
         def signature (defaults are evaluated at def time, not per call)."""
@@ -408,7 +445,8 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
     the (necessarily incomplete) selected set."""
     selected: set[int] = set()
     select_all = False
-    for old_path, new_path, changed_old, insert_anchors in sections:
+    for (old_path, new_path, changed_old, insert_anchors,
+         trivial_old, trivial_anchors, binary) in sections:
         path = old_path if old_path is not None else new_path
         if path is None:
             continue
@@ -416,7 +454,12 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         if file_index is None:
             continue
         if file_index["kind"] == "fixture":
-            if changed_old or insert_anchors:
+            # In sqlglot's .sql fixtures a "#" line is not a comment: it is
+            # metadata (# title:, # execute:, # dialect: ...) that
+            # tests/helpers.py's _extract_meta/load_sql_fixtures attach to
+            # the next statement. Any edit to a fixture, including a binary
+            # one (.csv.gz), counts.
+            if changed_old or insert_anchors or trivial_old or trivial_anchors or binary:
                 selected.update(file_index["tests"])
             continue
 
@@ -424,6 +467,19 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         if resolver is None:
             resolver = FileResolver(file_index)
             resolver_cache[path] = resolver
+
+        # A "# comment" or blank line is only harmless outside string
+        # literals. Inside a multi-line string whose value is used at
+        # runtime it changes that value, so treat it as a real edit.
+        if trivial_old or trivial_anchors:
+            changed_old = set(changed_old)
+            insert_anchors = set(insert_anchors)
+            for ln in trivial_old:
+                if resolver.string_line_removed(ln):
+                    changed_old.add(ln)
+            for a in trivial_anchors:
+                if resolver.string_insert_after(a):
+                    insert_anchors.add(a)
 
         needs_dialect_escalation = False
         import_owners: set[str] = set()

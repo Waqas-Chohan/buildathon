@@ -188,10 +188,37 @@ def main() -> None:
                 if lines:
                     sig.setdefault(path, []).append([min(lines), max(lines), n.lineno, n.end_lineno])
 
+    # Multi-line string literals whose value is used at runtime (not bare
+    # string statements such as docstrings): a "# comment" or blank line
+    # added/removed inside one changes the value, so it is not trivial.
+    strspans: dict[str, list] = {}
+    for path, fi in files.items():
+        if fi["kind"] != "python" or not os.path.exists(src + path):
+            continue
+        try:
+            tree = tree_for(path)
+        except SyntaxError:
+            continue
+        bare = {id(n.value) for n in ast.walk(tree)
+                if isinstance(n, ast.Expr) and isinstance(n.value, (ast.Constant, ast.JoinedStr))}
+        spans = set()
+        for n in ast.walk(tree):
+            if id(n) in bare or n.__class__ not in (ast.Constant, ast.JoinedStr):
+                continue
+            if isinstance(n, ast.Constant) and not isinstance(n.value, (str, bytes)):
+                continue
+            if n.end_lineno > n.lineno:
+                spans.add((n.lineno, n.end_lineno))
+        if spans:
+            strspans[path] = sorted(spans)
+
     index["eager_files"] = eager
     for path, fi in files.items():
         fi.pop("imp", None)
         fi.pop("sig", None)
+        fi.pop("strspans", None)
+        if path in strspans:
+            fi["strspans"] = [list(s) for s in strspans[path]]
         if path in imp:
             fi["imp"] = sorted(imp[path])
         if path in sig:
