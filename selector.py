@@ -619,14 +619,14 @@ _PRECISE_FOUNDATIONAL = False
 
 # Tight mode (see FileResolver.take_runtime_edits). Off until mutation
 # testing shows it never misses.
-_TIGHT = False
+_TIGHT = True
 
 # Skip files whose only edits are provably equivalent rewrites.
 _EQUIV = True
 
 # Class-body data attributes select only tests that read them (see
 # _take_attr_edits). Off until mutation testing shows it never misses.
-_ATTR = False
+_ATTR = True
 
 
 _ATTR_READS: dict = {}
