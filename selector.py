@@ -309,6 +309,73 @@ class FileResolver:
         lo, hi = self.tightest_range(anchor)
         selected.update(self.aggregate(lo, hi))
 
+    # -- import-time / def-time lines (see build/augment_import_time.py) --
+    #
+    # Some function-body lines only ever run while a module or class is
+    # being created: metaclass/__init_subclass__ hooks (_Dialect.__new__,
+    # Tokenizer.__init_subclass__), table builders (_build_coerces_to,
+    # _build_gen_dispatch), trie.new_trie, builder helpers called inside
+    # class-body dicts. Their per-test attribution is empty or just "whoever
+    # imported this dialect first" (~12 tests for _Dialect.__new__), yet the
+    # state they build is read by everything after. Treating them as precise
+    # selected those few tests AND skipped every escalation, including the
+    # foundational select-all -- a guaranteed miss for any mutation there.
+    def import_time_entry(self, line: int):
+        """Returns (func_lo, func_hi, owner_files) if `line` is a body line that
+        runs at import time, else None."""
+        lookup = getattr(self, "_imp_lookup", None)
+        if lookup is None:
+            lookup = {}
+            for lo, hi, owners, lines in self.idx.get("imp", ()):
+                for ln in lines:
+                    lookup.setdefault(ln, (lo, hi, owners))
+            self._imp_lookup = lookup
+        return lookup.get(line)
+
+    def import_time_span(self, anchor: int):
+        """For an insertion: the innermost import-time function whose span
+        contains `anchor` (code inserted there would also run at import)."""
+        best = None
+        for lo, hi, owners, _lines in self.idx.get("imp", ()):
+            if lo < anchor <= hi and (best is None or hi - lo < best[1] - best[0]):
+                best = (lo, hi, owners)
+        return best
+
+    # -- expression-class declarations (see build/exprclass_plugin.py) --
+    #
+    # Expression classes (sqlglot/expressions/*.py and friends) are mostly
+    # pure declarations -- arg_types, is_var_len_args, _sql_names -- whose
+    # lines never run at test time, so coverage attributes them to nobody:
+    # a "constraint": False -> True flip in an arg_types dict selected zero
+    # tests (12.8% of all mutable source lines had an empty selection this
+    # way). The tests that depend on a declaration are the ones that build
+    # instances of that class or of a subclass that inherits it; that set
+    # was recorded at build time and is looked up here.
+    def expr_class_tests(self, line: int):
+        """Tests depending on the declarations of the innermost expression
+        class containing `line`: None (not in one), "*" (nearly the whole
+        suite), or a list of test indices."""
+        exprcls = self.idx.get("exprcls")
+        if not exprcls:
+            return None
+        keys = self.idx["keys"]
+        best = None
+        for lo, hi, kidx in self.idx["ranges"]:
+            if lo <= line <= hi and keys[kidx].startswith("class:"):
+                if best is None or hi - lo < best[1] - best[0]:
+                    best = (lo, hi, keys[kidx][6:])
+        if best is None:
+            return None
+        return exprcls.get(best[2])
+
+    def signature_span(self, line: int):
+        """(func_lo, func_hi) if `line` is a parameter line of a multi-line
+        def signature (defaults are evaluated at def time, not per call)."""
+        for p_lo, p_hi, f_lo, f_hi in self.idx.get("sig", ()):
+            if p_lo <= line <= p_hi:
+                return f_lo, f_hi
+        return None
+
 
 def _dialect_sibling_tests(dialect_name: str, files_index: dict, resolver_cache: dict,
                             selected: set[int]) -> None:
@@ -323,6 +390,15 @@ def _dialect_sibling_tests(dialect_name: str, files_index: dict, resolver_cache:
                 resolver = FileResolver(sib_index)
                 resolver_cache[sib_path] = resolver
             selected.update(resolver.aggregate(1, sib_index["file_hi"]))
+
+
+_EAGER_FILES: frozenset = frozenset()
+
+
+def configure(index: dict) -> None:
+    """Load index-wide settings (call once before resolve_commit)."""
+    global _EAGER_FILES
+    _EAGER_FILES = frozenset(index.get("eager_files", ()))
 
 
 def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[set[int], bool]:
@@ -350,8 +426,24 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
             resolver_cache[path] = resolver
 
         needs_dialect_escalation = False
+        import_owners: set[str] = set()
         for line in changed_old:
             precise = resolver.select_for_changed_line(line, selected)
+            imp = resolver.import_time_entry(line)
+            if imp is not None:
+                lo, hi, owners = imp
+                selected.update(resolver.aggregate(lo, hi))
+                import_owners.update(owners)
+                precise = False
+            sig = resolver.signature_span(line)
+            if sig is not None:
+                selected.update(resolver.aggregate(*sig))
+            if not precise:
+                users = resolver.expr_class_tests(line)
+                if users == "*":
+                    select_all = True
+                elif users:
+                    selected.update(users)
             if not precise:
                 needs_dialect_escalation = True
                 if path in _FOUNDATIONAL_FILES:
@@ -362,11 +454,43 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
                 select_all = True
         for anchor in insert_anchors:
             resolver.select_for_insertion(anchor, selected)
+            if resolver.find_tag(anchor)[0] != 3:
+                users = resolver.expr_class_tests(anchor)
+                if users == "*":
+                    select_all = True
+                elif users:
+                    selected.update(users)
+            imp = resolver.import_time_span(anchor)
+            if imp is not None:
+                lo, hi, owners = imp
+                selected.update(resolver.aggregate(lo, hi))
+                import_owners.update(owners)
 
         if needs_dialect_escalation:
             m = _DIALECT_FILE_RE.match(path)
             if m:
                 _dialect_sibling_tests(m.group(2), files_index, resolver_cache, selected)
+
+        # State built at import time lives in (and is read through) the
+        # module/class body that triggered the call -- escalate to every
+        # such owner file the same way a classbody change there would be.
+        for owner in import_owners:
+            # An owner loaded by a bare `import sqlglot` is loaded by every
+            # test, so state it builds at import time is global.
+            if owner in _FOUNDATIONAL_FILES or owner in _EAGER_FILES:
+                select_all = True
+                continue
+            owner_index = files_index.get(owner)
+            if owner_index is None or owner_index["kind"] != "python":
+                continue
+            owner_resolver = resolver_cache.get(owner)
+            if owner_resolver is None:
+                owner_resolver = FileResolver(owner_index)
+                resolver_cache[owner] = owner_resolver
+            selected.update(owner_resolver.aggregate(1, owner_index["file_hi"]))
+            om = _DIALECT_FILE_RE.match(owner)
+            if om:
+                _dialect_sibling_tests(om.group(2), files_index, resolver_cache, selected)
     return selected, select_all
 
 
@@ -393,6 +517,7 @@ def pack_workers(tests_with_durations: list[tuple[int, int]]) -> list[list[int]]
 
 def main() -> None:
     index = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+    configure(index)
     test_ids = index["test_ids"]
     files_index = index["files"]
 
