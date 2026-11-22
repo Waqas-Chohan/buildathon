@@ -323,6 +323,72 @@ class FileResolver:
             and not self.is_lazy(anchor) and not self.is_lazy(anchor + 1)
         )
 
+    # -- tight mode: exact selection for genuinely runtime edits --
+    #
+    # Per-test coverage of a function-body line is exact when the line only
+    # runs at call time: a test whose outcome changes must execute it. The
+    # exceptions are all measured at build time and excluded here: lines
+    # executed during import at ANY depth ("impall", e.g. parser code run
+    # while a dialect parses SQL into class constants), lazy process-wide
+    # caches ("lazy"), def-time signature defaults ("sig"), and import-time
+    # builders ("imp"). Coverage can also credit a wrapped statement to only
+    # some of its physical lines, so a line inside a multi-line statement
+    # takes the tests of the whole statement ("stmts").
+    def _runtime_line(self, line: int) -> bool:
+        code, kidx = self.find_tag(line)
+        if code != 3 or kidx is None:
+            return False
+        sets = getattr(self, "_tight_sets", None)
+        if sets is None:
+            sets = self._tight_sets = (
+                frozenset(self.idx.get("impall", ())),
+                frozenset(self.idx.get("lazy", ())),
+            )
+        impall, lazy = sets
+        return (
+            line not in impall
+            and line not in lazy
+            and self.import_time_entry(line) is None
+            and self.signature_span(line) is None
+        )
+
+    def _line_tests_exact(self, line: int, selected: set[int]) -> None:
+        t = self.idx["line_tests"].get(str(line))
+        if t:
+            selected.update(t)
+        for lo, hi in self.idx.get("stmts", ()):
+            if lo <= line <= hi:
+                selected.update(self.aggregate(lo, hi))
+
+    def take_runtime_edits(self, changed_old, insert_anchors, selected):
+        """Select exact tests for runtime edits; return the edits that still
+        need the conservative treatment."""
+        rest_changed = set()
+        for line in changed_old:
+            if self._runtime_line(line):
+                self._line_tests_exact(line, selected)
+            else:
+                rest_changed.add(line)
+        rest_anchors = set()
+        for a in insert_anchors:
+            if a in changed_old:
+                # "+" side of a replaced line: it runs wherever the old line
+                # ran, so the removed line's handling covers it -- unless
+                # that line itself needs the conservative path.
+                if a in rest_changed:
+                    rest_anchors.add(a)
+                continue
+            if (
+                self._runtime_line(a)
+                and self._runtime_line(a + 1)
+                and self.find_tag(a)[1] == self.find_tag(a + 1)[1]
+            ):
+                self._line_tests_exact(a, selected)
+                self._line_tests_exact(a + 1, selected)
+            else:
+                rest_anchors.add(a)
+        return rest_changed, rest_anchors
+
     def is_lazy(self, line: int) -> bool:
         """First-use initialisation whose result is cached process-wide
         (measured at build time, e.g. generator.py's _build_dispatch filling
@@ -478,6 +544,10 @@ _EAGER_FILES: frozenset = frozenset()
 # selection). The full-suite fallback for core files is load-bearing.
 _PRECISE_FOUNDATIONAL = False
 
+# Tight mode (see FileResolver.take_runtime_edits). Off until mutation
+# testing shows it never misses.
+_TIGHT = False
+
 
 def configure(index: dict) -> None:
     """Load index-wide settings (call once before resolve_commit)."""
@@ -527,6 +597,11 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
             for a in trivial_anchors:
                 if resolver.string_insert_after(a):
                     insert_anchors.add(a)
+
+        if _TIGHT:
+            changed_old, insert_anchors = resolver.take_runtime_edits(
+                changed_old, insert_anchors, selected
+            )
 
         needs_dialect_escalation = False
         import_owners: set[str] = set()

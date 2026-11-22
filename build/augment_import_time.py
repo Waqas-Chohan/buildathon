@@ -77,6 +77,21 @@ def main() -> None:
             return None, None
         return d, rel(f.f_code.co_filename)
 
+    # Every function-body line executed while importing, at ANY depth: e.g.
+    # a dialect module parsing SQL strings during class creation runs deep
+    # parser code whose result is cached in class constants. Mutation
+    # testing found exactly this (parser.py:4653 _parse_into, run while
+    # Athena's classes are created, broke Athena tests that never call it
+    # at runtime), so such lines can't use per-test attribution.
+    all_import_lines: set[tuple[str, int]] = set()
+
+    def deep_local_for(r):
+        def deep_local(fr, ev, a):
+            if ev == "line":
+                all_import_lines.add((r, fr.f_lineno))
+            return deep_local
+        return deep_local
+
     def tracer(frame, event, arg):
         if event != "call":
             return None
@@ -86,7 +101,7 @@ def main() -> None:
             return None
         d, owner = depth_and_owner(frame)
         if d is None or d > MAX_DEPTH:
-            return None
+            return deep_local_for(r) if d is not None else None
         key = (r, co.co_firstlineno)
         ent = funcs.setdefault(key, {"owners": set()})
         if owner:
@@ -94,8 +109,10 @@ def main() -> None:
         lines = exec_lines.setdefault(key, set())
 
         def local(fr, ev, a):
-            if ev == "line" and fr.f_code is co:
-                lines.add(fr.f_lineno)
+            if ev == "line":
+                all_import_lines.add((r, fr.f_lineno))
+                if fr.f_code is co:
+                    lines.add(fr.f_lineno)
             return local
 
         return local
@@ -201,6 +218,7 @@ def main() -> None:
                 return n.lineno, n.end_lineno
         return firstline, firstline
 
+    _src_cache: dict[str, list] = {}
     imp: dict[str, list] = {}
     for (path, firstline), ent in funcs.items():
         fi = files.get(path)
@@ -266,12 +284,57 @@ def main() -> None:
         if spans:
             strspans[path] = sorted(spans)
 
+    # impall: body lines executed at import (any depth), minus lambda lines
+    # whose runtime calls already give them exact attribution.
+    impall: dict[str, list] = {}
+    for r, ln in all_import_lines:
+        fi = files.get(r)
+        if fi is None or fi["kind"] != "python" or tag(fi, ln) != 3:
+            continue
+        src_lines = _src_cache.setdefault(r, open(src + r, encoding="utf-8").read().splitlines())
+        if "lambda" in src_lines[ln - 1] and fi["line_tests"].get(str(ln)):
+            continue
+        impall.setdefault(r, []).append(ln)
+
+    # stmts: line spans of multi-line statements inside functions (for
+    # compound statements, just the header). Coverage may credit such a
+    # statement to only some of its physical lines.
+    stmts: dict[str, list] = {}
+    for path, fi in files.items():
+        if fi["kind"] != "python" or not os.path.exists(src + path):
+            continue
+        try:
+            tree = tree_for(path)
+        except SyntaxError:
+            continue
+        spans = set()
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for n in ast.walk(fn):
+                if not isinstance(n, ast.stmt) or n is fn or isinstance(
+                    n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+                body = getattr(n, "body", None)
+                hi = (body[0].lineno - 1) if isinstance(body, list) and body and isinstance(body[0], ast.AST) else n.end_lineno
+                if hi > n.lineno:
+                    spans.add((n.lineno, hi))
+        if spans:
+            stmts[path] = sorted(spans)
+
     index["eager_files"] = eager
     for path, fi in files.items():
         fi.pop("imp", None)
         fi.pop("sig", None)
         fi.pop("strspans", None)
         fi.pop("lazy", None)
+        fi.pop("impall", None)
+        fi.pop("stmts", None)
+        if path in impall:
+            fi["impall"] = sorted(set(impall[path]))
+        if path in stmts:
+            fi["stmts"] = [list(x) for x in stmts[path]]
         if path in lazy and fi["kind"] == "python":
             fi["lazy"] = sorted(lazy[path])
         if path in strspans:
