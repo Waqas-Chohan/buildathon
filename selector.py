@@ -147,17 +147,22 @@ _FOUNDATIONAL_FILES = frozenset({
     # Same shape of gap for jsonpath_tokenizer_class = JSONPathTokenizer,
     # defined in jsonpath.py subclassing the base Tokenizer.
     "sqlglot/jsonpath.py",
-    # Same shape of gap one more time, confirmed by grepping every
-    # dialects/*.py file for "TypeAnnotator." (the class defined here):
-    # sqlglot/dialects/bigquery.py builds its own COERCES_TO dict as
-    # "**TypeAnnotator.COERCES_TO, <bigquery overrides>" at class-body
-    # time, with zero inheritance relationship to this file at all --
-    # bigquery.py doesn't subclass TypeAnnotator, it just copies its dict
-    # once. Any dialect's type-annotation tests could be relying on this
-    # same base COERCES_TO table even without copying it verbatim, so
-    # treat this file the same as the other optimizer/executor base
-    # classes above rather than chase down every individual reader.
-    "sqlglot/optimizer/annotate_types.py",
+    # NOTE: sqlglot/optimizer/annotate_types.py was added here on the
+    # theory that bigquery.py's "**TypeAnnotator.COERCES_TO" copy needed
+    # the same full-suite safety net as the files above. A real submission
+    # proved that wrong: cost went up (~12s) with the same 1 commit still
+    # missed, meaning this fired on at least one real commit for no
+    # benefit. Checked why: annotate_types.py's class-level "ranges" entry
+    # for the whole TypeAnnotator class spans its entire body (line 160 to
+    # EOF, one single range covering every method), so the ALREADY-EXISTING
+    # generic classbody aggregate (the non-foundational fallback a few
+    # lines below) aggregates over that whole range for ANY classbody-level
+    # change in this file -- which already pulls in 21 bigquery tests
+    # alongside everything else that calls into TypeAnnotator's methods.
+    # Verified directly: aggregate(160, 1192) on the current index already
+    # includes tests/dialects/test_bigquery.py tests. The foundational
+    # (select-everything) treatment was solving an already-solved problem
+    # at full-suite cost. Removed.
 })
 
 
