@@ -369,22 +369,26 @@ class FileResolver:
                 best = (lo, hi, owners)
         return best
 
-    # -- expression-class declarations (see build/exprclass_plugin.py) --
+    # -- class-level declarations (see build/exprclass_plugin.py) --
     #
-    # Expression classes (sqlglot/expressions/*.py and friends) are mostly
-    # pure declarations -- arg_types, is_var_len_args, _sql_names -- whose
-    # lines never run at test time, so coverage attributes them to nobody:
-    # a "constraint": False -> True flip in an arg_types dict selected zero
-    # tests (12.8% of all mutable source lines had an empty selection this
-    # way). The tests that depend on a declaration are the ones that build
-    # instances of that class or of a subclass that inherits it; that set
-    # was recorded at build time and is looked up here.
-    def expr_class_tests(self, line: int):
-        """Tests depending on the declarations of the innermost expression
-        class containing `line`: None (not in one), "*" (nearly the whole
-        suite), or a list of test indices."""
-        exprcls = self.idx.get("exprcls")
-        if not exprcls:
+    # Class bodies are mostly declarations -- arg_types / is_var_len_args on
+    # expression classes, feature flags such as SET_OP_LIMITS or TIME_MAPPING
+    # on Dialect/Tokenizer/Parser/Generator subclasses -- whose lines never
+    # run at test time; base-class code reads them. Coverage attributes them
+    # to nobody (12.8% of all mutable source lines had an EMPTY selection),
+    # and for dialects it misses tests that only *write* that dialect: a
+    # T-SQL test generating Teradata SQL runs only base Generator code with
+    # TeradataGenerator's flags (mutation-tested: SET_OP_LIMITS True->False
+    # broke test_tsql's test_set_operation_branch_limits, outside every
+    # coverage-based selection). The tests that depend on a class's
+    # declarations are the ones that instantiate it or a subclass inheriting
+    # them; that set was recorded at build time and is looked up here.
+    def class_user_tests(self, line: int):
+        """Tests depending on the declarations of the innermost tracked class
+        containing `line`: None (not in one), "*" (nearly the whole suite),
+        or a list of test indices."""
+        users = self.idx.get("clsusers")
+        if not users:
             return None
         keys = self.idx["keys"]
         best = None
@@ -394,7 +398,7 @@ class FileResolver:
                     best = (lo, hi, keys[kidx][6:])
         if best is None:
             return None
-        return exprcls.get(best[2])
+        return users.get(best[2])
 
     def string_line_removed(self, line: int) -> bool:
         """Removing old line `line` changes a runtime multi-line string
@@ -495,7 +499,7 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
             if sig is not None:
                 selected.update(resolver.aggregate(*sig))
             if not precise:
-                users = resolver.expr_class_tests(line)
+                users = resolver.class_user_tests(line)
                 if users == "*":
                     select_all = True
                 elif users:
@@ -511,7 +515,7 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         for anchor in insert_anchors:
             resolver.select_for_insertion(anchor, selected)
             if resolver.find_tag(anchor)[0] != 3:
-                users = resolver.expr_class_tests(anchor)
+                users = resolver.class_user_tests(anchor)
                 if users == "*":
                     select_all = True
                 elif users:
