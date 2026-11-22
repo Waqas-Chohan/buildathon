@@ -309,6 +309,29 @@ class FileResolver:
                 return code, kidx
         return 0, None
 
+    def insertion_is_precise(self, anchor: int) -> bool:
+        """An edit landing after old line `anchor` (a replaced line's "+"
+        side has anchor == that line) stays inside one runtime function
+        body: both neighbours are body lines of the same function and
+        neither runs at import time."""
+        c1, k1 = self.find_tag(anchor)
+        c2, k2 = self.find_tag(anchor + 1)
+        return (
+            c1 == 3 and c2 == 3 and k1 == k2 and k1 is not None
+            and self.import_time_entry(anchor) is None
+            and self.import_time_entry(anchor + 1) is None
+            and not self.is_lazy(anchor) and not self.is_lazy(anchor + 1)
+        )
+
+    def is_lazy(self, line: int) -> bool:
+        """First-use initialisation whose result is cached process-wide
+        (measured at build time, e.g. generator.py's _build_dispatch filling
+        _DISPATCH_CACHE): credited only to the first test that triggered it."""
+        lazy = getattr(self, "_lazy", None)
+        if lazy is None:
+            lazy = self._lazy = frozenset(self.idx.get("lazy", ()))
+        return line in lazy
+
     def range_bounds_for_key(self, kidx: int):
         key = self.idx["keys"][kidx]
         if key == "module:<module>":
@@ -446,6 +469,12 @@ def _dialect_sibling_tests(dialect_name: str, files_index: dict, resolver_cache:
 
 _EAGER_FILES: frozenset = frozenset()
 
+# When True, a foundational file only escalates to the full suite for
+# class/module-level, header, import-time or ambiguous edits; an edit
+# inside an ordinary method body uses that method's exact test set like any
+# other file. Off unless mutation testing shows it never misses.
+_PRECISE_FOUNDATIONAL = False
+
 
 def configure(index: dict) -> None:
     """Load index-wide settings (call once before resolve_commit)."""
@@ -500,6 +529,8 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         import_owners: set[str] = set()
         for line in changed_old:
             precise = resolver.select_for_changed_line(line, selected)
+            if resolver.is_lazy(line):
+                precise = False
             imp = resolver.import_time_entry(line)
             if imp is not None:
                 lo, hi, owners = imp
@@ -522,7 +553,10 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         if insert_anchors:
             needs_dialect_escalation = True
             if path in _FOUNDATIONAL_FILES:
-                select_all = True
+                if not _PRECISE_FOUNDATIONAL or any(
+                    not resolver.insertion_is_precise(a) for a in insert_anchors
+                ):
+                    select_all = True
         for anchor in insert_anchors:
             resolver.select_for_insertion(anchor, selected)
             if resolver.find_tag(anchor)[0] != 3:

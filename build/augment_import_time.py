@@ -121,6 +121,60 @@ def main() -> None:
     finally:
         sys.settrace(None)
 
+    # Lazy runtime caches: run a small workload twice per dialect; lines that
+    # execute on the first run but not on an identical second run are
+    # first-use initialisation whose result is cached and reused (e.g.
+    # generator.py's _DISPATCH_CACHE filled by _build_dispatch). Like
+    # import-time code, coverage credits them only to the first test.
+    lazy: dict[str, set[int]] = {}
+    try:
+        from sqlglot import exp as _exp
+        from sqlglot.dialects.dialect import Dialect as _D
+        from sqlglot.executor import execute as _execute
+        from sqlglot.optimizer import optimize as _optimize
+
+        def workload(d):
+            sqlglot.transpile("SELECT a, SUM(b) AS s FROM t WHERE c > 1 GROUP BY a", read=d, write=d)
+            _optimize(sqlglot.parse_one("SELECT a FROM t WHERE b = 1", read=d),
+                      schema={"t": {"a": "INT", "b": "INT"}}, dialect=d)
+
+        def traced_lines(fn):
+            seen: set[tuple[str, int]] = set()
+
+            def gt(frame, event, arg):
+                r = rel(frame.f_code.co_filename)
+                if r is None or not r.startswith("sqlglot/"):
+                    return None
+
+                def lt(fr, ev, a):
+                    if ev == "line":
+                        seen.add((r, fr.f_lineno))
+                    return lt
+
+                return lt
+
+            sys.settrace(gt)
+            try:
+                fn()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                sys.settrace(None)
+            return seen
+
+        names = [""] + sorted(k for k in _D.classes if k)
+        for d in names:
+            first = traced_lines(lambda: workload(d))
+            second = traced_lines(lambda: workload(d))
+            for r, ln in first - second:
+                lazy.setdefault(r, set()).add(ln)
+        first = traced_lines(lambda: _execute("SELECT 1 AS x"))
+        second = traced_lines(lambda: _execute("SELECT 1 AS x"))
+        for r, ln in first - second:
+            lazy.setdefault(r, set()).add(ln)
+    except Exception as e:  # noqa: BLE001
+        print(f"lazy-cache detection skipped: {e!r}", file=sys.stderr)
+
     index = json.load(open(index_path, encoding="utf-8"))
     files = index["files"]
 
@@ -217,6 +271,9 @@ def main() -> None:
         fi.pop("imp", None)
         fi.pop("sig", None)
         fi.pop("strspans", None)
+        fi.pop("lazy", None)
+        if path in lazy and fi["kind"] == "python":
+            fi["lazy"] = sorted(lazy[path])
         if path in strspans:
             fi["strspans"] = [list(s) for s in strspans[path]]
         if path in imp:
