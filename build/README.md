@@ -65,3 +65,13 @@ each mutant, so any failure there is a proven miss. The old selector
 missed in every category fixed by steps 2 and 3. Examples:
 `simplify.py:1984` (import-time dispatch table) and `temporal.py:54`
 (`arg_types` flip).
+
+## 4. Ship it
+
+```sh
+gzip -9 -n -c index.json > index.json.gz   # what the Dockerfile copies
+```
+
+The image ships the gzip-compressed index. It is about 0.9 MB instead of
+about 13 MB, which keeps the repository well under the 20 MB limit.
+`selector.py` decompresses it with the standard library.

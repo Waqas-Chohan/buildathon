@@ -9,13 +9,24 @@ No network, no coverage/pytest needed here -- just stdlib.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import sys
 from pathlib import Path
 
 DATA = Path("/data")
-INDEX_PATH = Path("/app/index.json")
+# Shipped gzip-compressed: ~0.9 MB instead of ~13 MB keeps the repository
+# well inside the 20 MB limit, and decompressing is cheaper than the extra
+# I/O (measured: 0.23 s vs 0.25 s CPU to load).
+INDEX_PATH = Path("/app/index.json.gz")
+
+
+def load_index(path: Path) -> dict:
+    raw = path.read_bytes()
+    if path.suffix == ".gz":
+        raw = gzip.decompress(raw)
+    return json.loads(raw)
 MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 
@@ -576,7 +587,7 @@ def pack_workers(tests_with_durations: list[tuple[int, int]]) -> list[list[int]]
 
 
 def main() -> None:
-    index = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+    index = load_index(INDEX_PATH)
     configure(index)
     test_ids = index["test_ids"]
     files_index = index["files"]

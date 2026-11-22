@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 output.jsonl
+
+# Built locally by build/*.py; the image ships index.json.gz
+index.json
