@@ -4,3 +4,6 @@ output.jsonl
 
 # Built locally by build/*.py; the image ships index.json.gz
 index.json
+
+# Local dev harness state (sqlglot clone, venv, mutants)
+.work/

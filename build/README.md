@@ -75,3 +75,44 @@ gzip -9 -n -c index.json > index.json.gz   # what the Dockerfile copies
 The image ships the gzip-compressed index. It is about 0.9 MB instead of
 about 13 MB, which keeps the repository well under the 20 MB limit.
 `selector.py` decompresses it with the standard library.
+
+## 5. test_execute_tpcds replay (`tpcds_*.py`)
+
+`test_execute_tpcds` (21.5 s) runs 99 TPC-DS queries, 57 of them through
+sqlglot's Python executor, and compares the results with DuckDB. A runtime
+edit in the optimizer or executor usually reaches only a few of those
+queries, so `selector.py` can replay exactly those queries against the
+patched code at run time and drop the test when every one reproduces the
+pinned commit's result.
+
+* `tpcds_cov.json.gz` (committed, like the index): per-query *cold*
+  coverage. Each query ran in a fresh interpreter under coverage, started
+  before `import sqlglot`, so it is credited with import-time code and lazily
+  built caches as well as its own execution path. Also holds every file's
+  executable lines and each query's CPU cost. Regenerate with:
+
+  ```sh
+  python build/tpcds_prep.py sqlglot-src spec --no-baseline
+  python build/tpcds_coverage.py sqlglot-src spec build/tpcds_cov.json.gz /tmp/parts 6
+  ```
+
+* `tpcds_prep.py` (runs in the Dockerfile): parses the TPC-DS tables exactly
+  as `TestExecutor.setUpClass` does and records each query's fingerprint
+  (result columns and rows, and the DuckDB transpilation) at the pinned
+  commit under two hash seeds. A query whose fingerprint depends on the seed
+  is marked unstable and never trusted.
+* `tpcds_common.py` (shipped): the replay. Like one pool worker, it shares a
+  single unpickled schema and set of tables across the queries it runs, and
+  fails if either was modified afterwards.
+
+The selector only attempts the replay when every edit is a 1:1 replacement
+of runtime function-body lines (tight mode's rules) at unchanged
+indentation, and when its estimated CPU cost is under half the simulated
+seconds dropping the test saves. A replay that fails, raises, or exceeds its
+CPU limit keeps the test.
+
+## 6. Packed index (`pack_index.py`)
+
+The Dockerfile repacks `index.json.gz` into `/app/index.pack`: a JSON header
+plus one JSON slice per file, decoded only when a commit touches that file.
+Loading drops from ~0.5 s to under 0.01 s of CPU per run.
