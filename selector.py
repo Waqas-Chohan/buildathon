@@ -624,11 +624,64 @@ _TIGHT = False
 # Skip files whose only edits are provably equivalent rewrites.
 _EQUIV = True
 
+# Class-body data attributes select only tests that read them (see
+# _take_attr_edits). Off until mutation testing shows it never misses.
+_ATTR = False
+
+
+_ATTR_READS: dict = {}
+
 
 def configure(index: dict) -> None:
     """Load index-wide settings (call once before resolve_commit)."""
-    global _EAGER_FILES
+    global _EAGER_FILES, _ATTR_READS
     _EAGER_FILES = frozenset(index.get("eager_files", ()))
+    _ATTR_READS = index.get("attr_reads", {})
+
+
+def _take_attr_edits(resolver, changed_old, insert_anchors, selected, files_index, resolver_cache):
+    """Class-body data attributes (`SET_OP_LIMITS = True`, `WEEK_OFFSET = -1`)
+    only matter where they are read. When every read of that name anywhere
+    in sqlglot/tests is an ordinary runtime line (attr_reads[name] is a
+    list -- build time marks it "*" if any read happens at class creation /
+    import time, or if it's never read statically, i.e. read reflectively),
+    the affected tests are those executing a read, restricted to tests that
+    use this class or a subclass. Returns the edits left for the
+    conservative path."""
+    reads_map = _ATTR_READS
+    spans = resolver.idx.get("attrs")
+    if not spans or not reads_map:
+        return changed_old, insert_anchors
+
+    def attr_at(line):
+        for lo, hi, name in spans:
+            if lo <= line <= hi:
+                return name
+        return None
+
+    handled = set()
+    for line in changed_old:
+        if resolver.find_tag(line)[0] != 1:
+            continue
+        name = attr_at(line)
+        reads = reads_map.get(name) if name else None
+        if not isinstance(reads, list):
+            continue
+        hit: set[int] = set()
+        for path, ln in reads:
+            fi = files_index.get(path)
+            if fi is not None:
+                hit.update(fi["line_tests"].get(str(ln), ()))
+        users = resolver.class_user_tests(line)
+        if isinstance(users, list):
+            hit &= set(users)
+        selected.update(hit)
+        handled.add(line)
+    if not handled:
+        return changed_old, insert_anchors
+    rest_changed = set(changed_old) - handled
+    rest_anchors = {a for a in insert_anchors if a not in handled}
+    return rest_changed, rest_anchors
 
 
 def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[set[int], bool]:
@@ -695,6 +748,10 @@ def resolve_commit(sections, files_index: dict, resolver_cache: dict) -> tuple[s
         if _TIGHT:
             changed_old, insert_anchors = resolver.take_runtime_edits(
                 changed_old, insert_anchors, selected
+            )
+        if _ATTR:
+            changed_old, insert_anchors = _take_attr_edits(
+                resolver, changed_old, insert_anchors, selected, files_index, resolver_cache
             )
 
 

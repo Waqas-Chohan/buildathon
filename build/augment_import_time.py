@@ -323,6 +323,68 @@ def main() -> None:
         if spans:
             stmts[path] = sorted(spans)
 
+    # attrs: class-body assignments `NAME = ...` (their line spans) per
+    # file; attr_reads: for each such NAME, every line in sqlglot/ or tests/
+    # that reads it (`.NAME` attribute loads, or a "NAME" string constant,
+    # which covers getattr/hasattr by name). A read that isn't a runtime
+    # function-body line (class body, module level, import-time code) makes
+    # the attribute "*": its value is consumed at class creation and may be
+    # propagated anywhere, so the selector keeps its conservative handling.
+    attrs: dict[str, list] = {}
+    for path, fi in files.items():
+        if fi["kind"] != "python" or not path.startswith("sqlglot/") or not os.path.exists(src + path):
+            continue
+        try:
+            tree = tree_for(path)
+        except SyntaxError:
+            continue
+        spans = []
+        for cls in ast.walk(tree):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for st in cls.body:
+                targets = []
+                if isinstance(st, ast.Assign):
+                    targets = [t.id for t in st.targets if isinstance(t, ast.Name)]
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+                    targets = [st.target.id]
+                if len(targets) == 1:
+                    spans.append([st.lineno, st.end_lineno, targets[0]])
+        if spans:
+            attrs[path] = spans
+    wanted = {name for spans in attrs.values() for _, _, name in spans}
+    impall_sets = {r: set(v) for r, v in impall.items()}
+    reads: dict[str, set] = {}
+    star: set[str] = set()
+    for path, fi in files.items():
+        if fi["kind"] != "python" or not os.path.exists(src + path):
+            continue
+        try:
+            tree = tree_for(path)
+        except SyntaxError:
+            continue
+        for n in ast.walk(tree):
+            name = None
+            if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load) and n.attr in wanted:
+                name = n.attr
+            elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value in wanted:
+                name = n.value
+            if name is None or name in star:
+                continue
+            ln = n.lineno
+            if tag(fi, ln) != 3 or ln in impall_sets.get(path, ()):
+                star.add(name)
+                continue
+            reads.setdefault(name, set()).add((path, ln))
+    attr_reads = {}
+    for name in wanted:
+        # No static read at all means it's read reflectively (e.g. the
+        # generator dispatches `<key>_sql` methods via getattr(self,
+        # f"{key}_sql"); parsers look up `_parse_*` similarly): fall back.
+        dynamic = name.endswith("_sql") or name.startswith("_parse") or not reads.get(name)
+        attr_reads[name] = "*" if (name in star or dynamic) else sorted([p, l] for p, l in reads[name])
+    index["attr_reads"] = attr_reads
+
     index["eager_files"] = eager
     for path, fi in files.items():
         fi.pop("imp", None)
@@ -331,6 +393,9 @@ def main() -> None:
         fi.pop("lazy", None)
         fi.pop("impall", None)
         fi.pop("stmts", None)
+        fi.pop("attrs", None)
+        if path in attrs:
+            fi["attrs"] = attrs[path]
         if path in impall:
             fi["impall"] = sorted(set(impall[path]))
         if path in stmts:
